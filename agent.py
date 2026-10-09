@@ -1153,3 +1153,33 @@ def create_app_graph():
     saver = SqliteSaver(connection)
     saver.setup()
     return build_graph(checkpointer=saver), connection
+
+
+# -------------------- Streamlit integration helpers --------------------
+def new_config(thread_id: str) -> dict:
+    """LangGraph checkpoint configuration for a particular meeting workflow."""
+    return {"configurable": {"thread_id": str(thread_id)}}
+
+
+def initial_state(meeting_title: str, meeting_date: str, transcript: str) -> dict:
+    """Construct the initial workflow state, matching the notebook schema."""
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        raise ValueError("Transcript exceeds maximum length")
+    date.fromisoformat(meeting_date)
+    return {
+        "meeting_title": meeting_title,
+        "meeting_date": meeting_date,
+        "transcript": transcript,
+        "status": "new",
+    }
+
+
+def get_pending_interrupt(graph, config: dict) -> dict | None:
+    """Return the pending human request from a checkpoint, if one exists."""
+    snapshot = graph.get_state(config)
+    for task in getattr(snapshot, "tasks", ()) or ():
+        for item in getattr(task, "interrupts", ()) or ():
+            value = getattr(item, "value", None)
+            if isinstance(value, dict):
+                return value
+    return None

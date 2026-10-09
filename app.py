@@ -9,34 +9,17 @@ from langgraph.types import Command
 
 st.set_page_config(page_title="Meeting → Action Agent", page_icon="📋", layout="wide")
 
-# Secrets are never committed. Set both in Streamlit Cloud App settings → Secrets.
+# Configure the Gemini API key in Streamlit Cloud Secrets, never in GitHub.
 try:
     configured_secrets = dict(st.secrets)
 except Exception:
     configured_secrets = {}
-for key in ("GEMINI_API_KEY", "APP_PASSWORD", "MEETING_AGENT_STORAGE"):
+for key in ("GEMINI_API_KEY", "MEETING_AGENT_STORAGE"):
     if configured_secrets.get(key) and not os.environ.get(key):
         os.environ[key] = str(configured_secrets[key])
 
 st.title("📋 Meeting → Action Agent")
 st.caption("Gemini + LangGraph · Tool selection · Human clarification · Approval · SQLite")
-
-password = os.environ.get("APP_PASSWORD")
-if not password:
-    st.error("APP_PASSWORD is missing. Add APP_PASSWORD to your Streamlit secrets before using this app.")
-    st.stop()
-if not st.session_state.get("authenticated"):
-    with st.form("login"):
-        entry = st.text_input("App password", type="password")
-        submitted = st.form_submit_button("Sign in")
-    if submitted:
-        import hmac
-        if hmac.compare_digest(entry, password):
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Incorrect password")
-    st.stop()
 
 # Import after configuring secret-driven environment variables.
 from agent import (
