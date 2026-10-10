@@ -34,6 +34,9 @@ def resources():
 
 graph, checkpoint_connection, graph_lock = resources()
 
+if "resume_notice" in st.session_state:
+    st.success(st.session_state.pop("resume_notice"))
+
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
 
@@ -47,9 +50,30 @@ def pending(thread_id):
 
 
 def resume(payload):
-    with graph_lock:
-        graph.invoke(Command(resume=payload), config=new_config(st.session_state.thread_id))
-    st.rerun()
+    """Resume once, verify checkpoint progression, and report an observable outcome."""
+    thread_id = st.session_state.thread_id
+    try:
+        with st.spinner("Submitting clarification and advancing workflow…"):
+            with graph_lock:
+                before = get_pending_interrupt(graph, new_config(thread_id))
+                graph.invoke(Command(resume=payload), config=new_config(thread_id))
+                after = get_pending_interrupt(graph, new_config(thread_id))
+                state_after = graph.get_state(new_config(thread_id)).values
+        if after == before and after is not None:
+            st.error("The workflow is still at the same step after submitting. Open Manage app → Logs for details.")
+            st.caption("Your answers were not confirmed as processed; don't start a new meeting yet.")
+            return
+        st.session_state["resume_notice"] = (
+            "Clarification submitted. Next step: " +
+            (str(after.get("message")) if after else str(state_after.get("status", "completed")))
+        )
+        st.rerun()
+    except Exception as exc:
+        import logging
+        logging.exception("Workflow resume failed (thread=%s)", thread_id)
+        st.error(f"Could not continue workflow: {type(exc).__name__}")
+        st.info("Check Manage app → Logs for the full traceback.")
+        return
 
 
 with st.sidebar:
@@ -136,8 +160,10 @@ else:
                     if deadline.strip():
                         change["deadline_date"] = deadline.strip()
                     if change: answers[str(index)] = change
-            go = st.form_submit_button("Continue to approval", type="primary")
+            st.caption("You can continue without entering any values. Scroll here to submit.")
+            go = st.form_submit_button("Continue to approval", type="primary", use_container_width=True)
         if go:
+            st.info("Continue clicked. Checking clarification answers…")
             bad = []
             for index, update in answers.items():
                 if update.get("deadline_date"):
