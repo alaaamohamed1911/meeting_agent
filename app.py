@@ -14,7 +14,7 @@ try:
     configured_secrets = dict(st.secrets)
 except Exception:
     configured_secrets = {}
-for key in ("GEMINI_API_KEY", "MEETING_AGENT_STORAGE"):
+for key in ("GEMINI_API_KEY", "MEETING_AGENT_STORAGE", "DATABASE_URL"):
     if configured_secrets.get(key) and not os.environ.get(key):
         os.environ[key] = str(configured_secrets[key])
 
@@ -24,7 +24,7 @@ st.caption("Gemini + LangGraph · Tool selection · Human clarification · Appro
 # Import after configuring secret-driven environment variables.
 from agent import (
     create_app_graph, get_pending_interrupt, new_config,
-    initial_state, get_tasks, MAX_TRANSCRIPT_CHARS,
+    initial_state, get_tasks, get_meetings, MAX_TRANSCRIPT_CHARS,
 )
 
 @st.cache_resource
@@ -33,9 +33,6 @@ def resources():
     return graph, conn, threading.RLock()
 
 graph, checkpoint_connection, graph_lock = resources()
-
-if "resume_notice" in st.session_state:
-    st.success(st.session_state.pop("resume_notice"))
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
@@ -50,30 +47,9 @@ def pending(thread_id):
 
 
 def resume(payload):
-    """Resume once, verify checkpoint progression, and report an observable outcome."""
-    thread_id = st.session_state.thread_id
-    try:
-        with st.spinner("Submitting clarification and advancing workflow…"):
-            with graph_lock:
-                before = get_pending_interrupt(graph, new_config(thread_id))
-                graph.invoke(Command(resume=payload), config=new_config(thread_id))
-                after = get_pending_interrupt(graph, new_config(thread_id))
-                state_after = graph.get_state(new_config(thread_id)).values
-        if after == before and after is not None:
-            st.error("The workflow is still at the same step after submitting. Open Manage app → Logs for details.")
-            st.caption("Your answers were not confirmed as processed; don't start a new meeting yet.")
-            return
-        st.session_state["resume_notice"] = (
-            "Clarification submitted. Next step: " +
-            (str(after.get("message")) if after else str(state_after.get("status", "completed")))
-        )
-        st.rerun()
-    except Exception as exc:
-        import logging
-        logging.exception("Workflow resume failed (thread=%s)", thread_id)
-        st.error(f"Could not continue workflow: {type(exc).__name__}")
-        st.info("Check Manage app → Logs for the full traceback.")
-        return
+    with graph_lock:
+        graph.invoke(Command(resume=payload), config=new_config(st.session_state.thread_id))
+    st.rerun()
 
 
 with st.sidebar:
@@ -81,7 +57,7 @@ with st.sidebar:
     if st.button("New meeting", use_container_width=True):
         st.session_state.thread_id = None
         st.rerun()
-    st.caption("SQLite files must live on persistent storage for durable data and paused workflows.")
+    st.caption("Durable storage: PostgreSQL" if os.environ.get("DATABASE_URL") else "Warning: local SQLite is temporary on Streamlit Cloud.")
     st.caption("This app is designed for a single trusted reviewer, not a multi-tenant production service.")
     with st.expander("Resume paused workflow"):
         restore = st.text_input("Thread ID", placeholder="Paste your workflow ID")
@@ -141,6 +117,61 @@ else:
             st.markdown("**Suggestions (not approved)**")
             for item in analysis.get("suggestions", []): st.write("•", item)
 
+    # Agent Activity Log: real saved LangGraph state, not generated explanations.
+    st.subheader("Agent Activity Log")
+    st.caption(
+        "Actual recorded action choices and tool observations. "
+        "This is an execution trace, not the model's private reasoning."
+    )
+    activity = state.get("resolution_history") or []
+    attempts = state.get("resolution_attempts", 0)
+    st.metric("Resolution tool calls", len(activity))
+    if activity:
+        tasks_for_log = analysis.get("tasks") or []
+        for step_number, event in enumerate(activity, start=1):
+            idx = event.get("task_index")
+            task_label = (
+                tasks_for_log[idx].get("title", "Unknown task")
+                if isinstance(idx, int) and 0 <= idx < len(tasks_for_log)
+                else f"Task {idx}"
+            )
+            action = event.get("action", "unknown")
+            outcome = event.get("tool_output") or {}
+            with st.expander(
+                f"{step_number}. {task_label} — {action}",
+                expanded=(step_number == 1),
+            ):
+                st.write("**Attempt:**", event.get("attempt", "—"))
+                st.write("**Gemini selected:**", action)
+                st.write("**Selection explanation:**", event.get("reason") or "Not provided")
+                if action == "resolve_relative_date":
+                    st.write("**Deadline expression:**", event.get("deadline_text") or "—")
+                    result_data = outcome.get("result") or {}
+                    st.write("**Resolved:**", result_data.get("resolved", False))
+                    st.write("**Date returned:**", result_data.get("date") or "—")
+                    st.write("**Tool note:**", result_data.get("reason") or outcome.get("reason") or "—")
+                elif action == "search_previous_meetings":
+                    st.write("**Search query:**", event.get("query") or "—")
+                    result_data = outcome.get("result") or {}
+                    st.write("**Matches found:**", len(result_data.get("matches") or []))
+                    st.caption("Search is read-only; historical owners are never assigned automatically.")
+                elif action == "request_human_clarification":
+                    st.write("**Observation:**", "Human clarification requested; no auto-assignment")
+                elif action == "finish":
+                    st.write("**Observation:**", "No further automatic action selected")
+                st.write("**Execution success:**", outcome.get("success", False))
+    else:
+        st.info(
+            "No resolution tool calls recorded for this meeting. "
+            "Tasks may already have passed validation, or this workflow "
+            "did not reach the resolution stage."
+        )
+    st.caption(
+        "Fixed workflow: Security → Extraction → Validation → Agentic Resolution "
+        "→ Human Clarification (if needed) → Human Approval → Database Save. "
+        "Gemini chooses actions only inside Agentic Resolution; saving requires approval."
+    )
+
     if request and request.get("message") == "Clarify missing task information":
         st.subheader("1 · Human clarification")
         st.info("Only supply confirmed information. Event-based deadlines can remain empty.")
@@ -160,10 +191,8 @@ else:
                     if deadline.strip():
                         change["deadline_date"] = deadline.strip()
                     if change: answers[str(index)] = change
-            st.caption("You can continue without entering any values. Scroll here to submit.")
-            go = st.form_submit_button("Continue to approval", type="primary", use_container_width=True)
+            go = st.form_submit_button("Continue to approval", type="primary")
         if go:
-            st.info("Continue clicked. Checking clarification answers…")
             bad = []
             for index, update in answers.items():
                 if update.get("deadline_date"):
@@ -232,3 +261,23 @@ with st.expander("Saved tasks"):
             st.caption("No saved tasks yet")
     except Exception:
         st.error("Unable to load saved tasks")
+
+
+st.divider()
+st.subheader("Meeting History")
+try:
+    meetings = get_meetings()
+    if not meetings:
+        st.info("No previously saved meetings yet.")
+    else:
+        labels = [f"#{m['id']} — {m['title']} ({m['meeting_date']}) · {m['task_count']} tasks" for m in meetings]
+        selected = st.selectbox("Open a saved meeting", list(range(len(meetings))), format_func=lambda i: labels[i], key="meeting_history_selection")
+        meeting = meetings[selected]
+        st.write("**Summary:**", meeting["summary"])
+        history_tasks = get_tasks(meeting["id"])
+        if history_tasks:
+            st.dataframe([{k: t.get(k) for k in (
+                "title", "owner", "deadline_date", "deadline_type", "dependency_type", "status"
+            )} for t in history_tasks], use_container_width=True, hide_index=True)
+except Exception as exc:
+    st.error(f"Meeting History unavailable: {type(exc).__name__}")
