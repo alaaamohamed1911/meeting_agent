@@ -24,7 +24,7 @@ st.caption("Gemini + LangGraph · Tool selection · Human clarification · Appro
 # Import after configuring secret-driven environment variables.
 from agent import (
     create_app_graph, get_pending_interrupt, new_config,
-    initial_state, get_tasks, get_meetings, MAX_TRANSCRIPT_CHARS,
+    initial_state, get_tasks, MAX_TRANSCRIPT_CHARS,
 )
 
 @st.cache_resource
@@ -33,6 +33,14 @@ def resources():
     return graph, conn, threading.RLock()
 
 graph, checkpoint_connection, graph_lock = resources()
+
+# Meeting History was introduced after the original agent.py.
+# Keep the Activity Log compatible with older deployed backends.
+try:
+    from agent import get_meetings
+except ImportError:
+    get_meetings = None
+
 
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
@@ -266,10 +274,14 @@ with st.expander("Saved tasks"):
 st.divider()
 st.subheader("Meeting History")
 try:
-    meetings = get_meetings()
-    if not meetings:
-        st.info("No previously saved meetings yet.")
+    if get_meetings is None:
+        st.info("Meeting History needs the updated agent.py; Activity Log works with the current backend.")
+        meetings = []
     else:
+        meetings = get_meetings()
+    if not meetings and get_meetings is not None:
+        st.info("No previously saved meetings yet.")
+    elif meetings:
         labels = [f"#{m['id']} — {m['title']} ({m['meeting_date']}) · {m['task_count']} tasks" for m in meetings]
         selected = st.selectbox("Open a saved meeting", list(range(len(meetings))), format_func=lambda i: labels[i], key="meeting_history_selection")
         meeting = meetings[selected]
